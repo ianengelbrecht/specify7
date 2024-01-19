@@ -432,6 +432,26 @@ def ID(table, index):
 def NODENUMBER(index):
     return 't{}.nodenumber'.format(index)
 
+def IDFIELDS(table, depth):
+    fields = []
+    for i in list(range(0, depth-1)):
+        field = f't{i}.{table}id'
+        fields.append(field)
+    
+    return ', '.join(fields)
+
+def parent_joins(table, depth):
+    return '\n'.join([
+        "left join {table} t{1} on t{0}.parentid = t{1}.{table}id".format(j-1, j, table=table)
+        for j in range(1, depth)
+    ])
+
+def definition_joins(table, depth):
+    return '\n'.join([
+        "left join {table}treedefitem d{0} on t{0}.{table}treedefitemid = d{0}.{table}treedefitemid".format(j, table=table)
+        for j in range(depth)
+    ])
+
 def fullname_expr(depth, reverse):
     fullname = CONCAT([
         IF(IN_NAME(i),
@@ -458,27 +478,15 @@ def fullname_expr(depth, reverse):
     # if node is not in fullname, its fullname is just its name
     return IF(IN_NAME(0), fullname, NAME(0))
 
-def parent_joins(table, depth):
-    return '\n'.join([
-        "left join {table} t{1} on t{0}.parentid = t{1}.{table}id".format(j-1, j, table=table)
-        for j in range(1, depth)
-    ])
-
-def definition_joins(table, depth):
-    return '\n'.join([
-        "left join {table}treedefitem d{0} on t{0}.{table}treedefitemid = d{0}.{table}treedefitemid".format(j, table=table)
-        for j in range(depth)
-    ])
-
 def set_fullnames(treedef, null_only=False, node_number_range=None):
     table = treedef.treeentries.model._meta.db_table
     depth = treedef.treedefitems.count()
     reverse = treedef.fullnamedirection == -1
     treedefid = treedef.id
-    logger.info('set_fullnames: %s', (table, treedefid, depth, reverse))
+    
     if depth < 1:
         return
-    cursor = connection.cursor()
+    
     sql = (
         "update {table} t0\n"
         "{parent_joins}\n"
@@ -500,11 +508,59 @@ def set_fullnames(treedef, null_only=False, node_number_range=None):
         node_number_range="and t0.nodenumber between {} and {}".format(node_number_range[0], node_number_range[1]) if not (node_number_range is None) else ''
     )
 
+    logger.info('set_fullnames: %s', (table, treedefid, depth, reverse))
     logger.debug('fullname update sql:\n%s', sql)
+    cursor = connection.cursor()
     return cursor.execute(sql)
 
-def predict_fullname(table, depth, parentid, defitemid, name, reverse=False):
+def get_ancestorids(table, depth, parentid):
+
+    # we want the taxon IDs from parentid to the root, inclusive
+    depth = depth - 1 #because the request comes from the new child taxon of the parent with its depth
+    sql = (
+        "select {ids}\n"
+        "from {table} t0\n"
+        "{parent_joins}\n"
+        "{definition_joins}\n"
+        "where t0.{table}id = {parentid}"
+    ).format(
+        ids = IDFIELDS(table, depth),
+        table=table,
+        parent_joins=parent_joins(table, depth),
+        definition_joins=definition_joins(table, depth),
+        parentid=parentid
+    )
+
     cursor = connection.cursor()
+    cursor.execute(sql)
+    ancestor_ids = cursor.fetchone()
+    return ancestor_ids
+
+def get_ancestors(table, depth, parentid):
+    ancestor_ids = get_ancestorids(table, depth, parentid)
+    ancestor_idstring = ', '.join(list(map(lambda x: str(x), ancestor_ids)))
+    
+    sql = (
+        "select {table}id, parentid, {table}.name as Name, {table}treedefitem.name as Rank,  IsInFullName, Author\n"
+        "from {table}\n"
+        "join {table}treedefitem on {table}.{table}treedefitemid = {table}treedefitem.{table}treedefitemid\n"
+        "where {table}id in ({ancestor_id_list})"
+    ).format(
+        table=table,
+        ancestor_id_list=ancestor_idstring
+    )
+
+    cursor = connection.cursor()
+    cursor.execute(sql)
+    results = []
+    for row in cursor:
+        results.append(row)
+
+    return results
+
+#this is the original function for fullnames on Specify trees, unchanged
+def predict_fullname_generic(table, depth, parentid, defitemid, name, reverse=False):
+    
     sql = (
         "select {fullname}\n"
         "from (select %(name)s as name,\n"
@@ -518,10 +574,134 @@ def predict_fullname(table, depth, parentid, defitemid, name, reverse=False):
         table=table,
         fullname=fullname_expr(depth, reverse),
         parent_joins=parent_joins(table, depth),
-        definition_joins=definition_joins(table, depth),
+        definition_joins=definition_joins(table, depth)
     )
+
+    cursor = connection.cursor()
     cursor.execute(sql, {'name': name, 'parentid': parentid, 'defitemid': defitemid})
     fullname, = cursor.fetchone()
+
+    #is there a reason we're not closing these cursors?
+    return fullname
+
+def predict_taxonname_with_authority(name, rank, authority, ancestors, code, isHybrid=False):
+
+    # guard conditions
+    # this function can only be called if we have a value for code. Use predict_fullname_generic otherwise
+    if code is None or code.strip() == "":
+        raise Exception("code is required")
+
+    # we must have a name
+    if name is None or name.strip() == "":
+        raise Exception("name cannot be empty")
+    
+    # we must have a rank
+    if rank is None or rank.strip() == "":
+        raise Exception("rank cannot be empty")
+    
+    # We're going to build a list of all the strings that make up a name, and then concatenate them
+    fullnameparts = []
+    # simple for zoological names
+    if code.strip().upper() == 'ICZN':
+
+        #we only need to cater for subgenera
+        for taxon in ancestors:
+            if taxon["IsInFullName"]:
+                if taxon["Rank"].lower() == 'subgenus' and not taxon["Name"].startswith('('): # lets assume the closing parenthesis will be there too
+                    fullnameparts.append('(' + taxon["Name"] + ')')
+                else:
+                    fullnameparts.append(taxon["Name"])
+        
+        # now the new name we were provided
+        if rank.lower() == 'subgenus' and not name.startswith('('): # lets assume the closing parenthesis will be there too
+            fullnameparts.append('(' + name + ')')
+        else:
+            fullnameparts.append(name)
+
+        fullnameparts.append(authority) #authority is always on the end for animal names
+    
+    else: #it's a plant/fungus, etc, so we have work to do...
+
+        # we have to add rank prefixes because a discipline's tree can have mixed plant and animal taxa and we can't rely on textbefore for this purpose
+        
+        rank_prefixes = {
+            "section": "sect.",
+            "subspecies": "subsp.",
+            "variety": "var.",
+            "subvariety": "subvar.",
+            "form": "f.",
+            "forma": "f.",
+            "subform": "subf.",
+            "subforma": "subf."
+        }
+        
+        # we need to keep the unaltered names also, to use later
+        epithets = [] 
+
+
+        # let's get all the name parts
+        for taxon in [taxon for taxon in ancestors if taxon["IsInFullName"]]:
+            epithets.append({"Name": taxon["Name"], "Author": taxon["Author"]})
+            if taxon["Rank"].lower() in rank_prefixes:
+                fullnameparts.append(rank_prefixes[taxon["Rank"].lower()] + ' ' + taxon["Name"])
+            elif taxon["Rank"].lower() == 'subgenus': #subgenera must be wrapped in parentheses
+                if taxon["Name"].startswith('('): # lets assume the closing parenthesis will be there too
+                    fullnameparts.append(taxon["Name"])
+                else: 
+                    fullnameparts.append('(' + taxon["Name"] + ')')
+            else:
+                fullnameparts.append(taxon["Name"])
+
+        # and same for the new name
+        epithets.append({"Name": name, "Author": authority})
+        if rank.lower() in rank_prefixes:
+            thisnamepart = rank_prefixes[rank.lower()] + ' ' + name
+        elif rank.lower() == 'subgenus':
+            if taxon["Name"].startswith('('): # lets assume the closing parenthesis will be there too
+                thisnamepart = name
+            else: 
+                thisnamepart = '(' + taxon["Name"] + ')'
+        else:
+            thisnamepart = name
+    
+        # if it's hybrid we add the multiplication sign in front of the name with a space, unless it's already there
+        if isHybrid and '× ' not in thisnamepart and 'x ' not in thisnamepart:
+            fullnameparts.append('× ' + thisnamepart)
+        else:
+            fullnameparts.append(thisnamepart)
+
+        # now we need to work out where the authority goes
+        # the rules are different if the name is above species or below species
+        is_species_or_lower = rank.lower() == 'species' or len([ancestor for ancestor in ancestors if ancestor["Rank"].lower() == "species"])
+        if is_species_or_lower:
+            # start from the bottom and work upwards
+            epithet = epithets.pop()
+            for index, parentEpithet in reversed(list(enumerate(epithets))):
+                if parentEpithet["Name"] != epithet["Name"]:
+                    fullnameparts.insert(index + 2, epithet["Author"]) # index + 2 because we popped the first, otherwise it would be index + 1
+                    break
+                else:
+                    epithet = parentEpithet
+        else: #just add it on the end
+            fullnameparts.append(authority)
+
+    
+    #filter out any empty values in case they got in somehow...
+    fullnameparts = [part.strip() for part in fullnameparts if part is not None and part.strip() != ""]
+
+    #and we're done
+    return ' '.join(fullnameparts)
+
+# this now pulls it all together
+def predict_fullname(table, depth, parentid, defitemid, name, rank, authority, code, isHybrid, reverse=False):
+
+    #if we don't have include_authority then we need to get it from the taxontreedef
+    if table == 'taxon' and code is not None and code.strip() != "":
+        ancestors = get_ancestors(table, depth, parentid)
+        fullname = predict_taxonname_with_authority(name, rank, authority, ancestors, code, isHybrid)
+    else:
+        fullname = predict_fullname_generic(table, depth, parentid, defitemid, name, reverse)
+    
     return fullname
 
 

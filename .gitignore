@@ -1,3 +1,5 @@
+.vscode
+
 *.pyc
 *~
 .vagrant
@@ -8,6 +10,7 @@ specifypanel/ve
 specifyweb/virtenv
 venv/
 ve/
+env/
 seed-database
 *.env
 
